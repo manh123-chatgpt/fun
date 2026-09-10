@@ -5,9 +5,15 @@ from tqdm import tqdm
 
 # === TỰ ĐỘNG NHẬN DIỆN MÔI TRƯỜNG ===
 if os.path.exists("/kaggle/input"):
-    # KAGGLE
-    DATA_DIR = "/kaggle/input/uit-legal-ir-data"
+    # KAGGLE - Tự dò tìm thư mục data chứa train.json
     WORK_DIR = "/kaggle/working"
+    _candidates = [
+        "/kaggle/input/datasets/thurdayafternoon/uit-legal-ir-data/uit-legal-ir-data",
+        "/kaggle/input/uit-legal-ir-data/uit-legal-ir-data",
+        "/kaggle/input/uit-legal-ir-data",
+    ]
+    DATA_DIR = next((p for p in _candidates if os.path.exists(os.path.join(p, "train.json"))), _candidates[0])
+    print(f"📂 Kaggle DATA_DIR: {DATA_DIR}")
 else:
     # LOCAL
     DATA_DIR = "LegalIR - Public Test-20260824T120008Z-1-001/LegalIR - Public Test"

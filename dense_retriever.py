@@ -151,7 +151,15 @@ class DenseSearcher:
         return [doc_id for doc_id, _ in sorted_docs[:top_k]]
 
 # Fine-tuned Vietnamese Bi-Encoder Super - GIỜ CŨNG CÓ LEGAL CHUNKING
-MODEL_FINETUNED_DIR = "fine_tuned_vietnamese_bi_encoder"
+import os as _os
+_model_candidates = [
+    "fine_tuned_vietnamese_bi_encoder",
+    "/kaggle/working/fine_tuned_vietnamese_bi_encoder",
+    "/kaggle/input/datasets/thurdayafternoon/uit-legal-finetuned-model/fine_tuned_vietnamese_bi_encoder",
+    "/kaggle/input/uit-legal-finetuned-model/fine_tuned_vietnamese_bi_encoder",
+    "/kaggle/input/uit-legal-finetuned-model",
+]
+MODEL_FINETUNED_DIR = next((p for p in _model_candidates if _os.path.exists(p)), _model_candidates[0])
 CACHE_FINETUNED = "corpus_embeddings_finetuned_resolved.pkl"
 
 class FineTunedDenseSearcher:
