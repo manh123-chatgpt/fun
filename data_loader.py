@@ -3,11 +3,21 @@ import json
 import glob
 from tqdm import tqdm
 
-DATA_DIR = "LegalIR - Public Test-20260824T120008Z-1-001/LegalIR - Public Test"
+# === TỰ ĐỘNG NHẬN DIỆN MÔI TRƯỜNG ===
+if os.path.exists("/kaggle/input"):
+    # KAGGLE
+    DATA_DIR = "/kaggle/input/uit-legal-ir-data"
+    WORK_DIR = "/kaggle/working"
+else:
+    # LOCAL
+    DATA_DIR = "LegalIR - Public Test-20260824T120008Z-1-001/LegalIR - Public Test"
+    WORK_DIR = "."
+
 CORPUS_DIR = os.path.join(DATA_DIR, "selected-contexts")
 
+
 def load_corpus(corpus_dir=CORPUS_DIR, force_original=False):
-    resolved_path = "legal_corpus_resolved.json"
+    resolved_path = os.path.join(WORK_DIR, "legal_corpus_resolved.json")
     if not force_original and os.path.exists(resolved_path):
         print(f"♻️ Đang nạp Corpus SIÊU CẤP (Graph Resolved) từ '{resolved_path}'...")
         with open(resolved_path, "r", encoding="utf-8") as f:
