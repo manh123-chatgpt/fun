@@ -1,0 +1,289 @@
+import os
+import json
+import zipfile
+import numpy as np
+from tqdm import tqdm
+from data_loader import load_corpus, load_train_data, load_test_data
+from bm25_retriever import BM25Searcher
+from dense_retriever import DenseSearcher
+from evaluator import compute_metrics
+import string
+from rank_bm25 import BM25Okapi
+
+import re
+
+# Từ điển ánh xạ từ viết tắt và thuật ngữ pháp lý Việt Nam phổ biến
+LEGAL_ACRONYMS = {
+    r"\bbhxh\b": "bhxh bảo hiểm xã hội",
+    r"\bbhyt\b": "bhyt bảo hiểm y tế",
+    r"\bbhtn\b": "bhtn bảo hiểm thất nghiệp",
+    r"\btand\b": "tand tòa án nhân dân",
+    r"\bvksnd\b": "vksnd viện kiểm sát nhân dân",
+    r"\bubnd\b": "ubnd ủy ban nhân dân",
+    r"\bhđnd\b": "hđnd hội đồng nhân dân",
+    r"\bhdnd\b": "hđnd hội đồng nhân dân",
+    r"\bdnnvv\b": "dnnvv doanh nghiệp nhỏ và vừa",
+    r"\bdn\b": "doanh nghiệp",
+    r"\bnlđ\b": "nlđ người lao động",
+    r"\bnld\b": "nlđ người lao động",
+    r"\bnsnn\b": "nsnn ngân sách nhà nước",
+    r"\bcsgt\b": "csgt cảnh sát giao thông",
+    r"\bpccc\b": "pccc phòng cháy chữa cháy",
+    r"\batlđ\b": "atlđ an toàn lao động",
+    r"\batld\b": "atlđ an toàn lao động",
+    r"\bttđb\b": "ttđb tiêu thụ đặc biệt",
+    r"\bttdb\b": "ttđb tiêu thụ đặc biệt",
+    r"\btndn\b": "tndn thu nhập doanh nghiệp",
+    r"\btncn\b": "tncn thu nhập cá nhân",
+    r"\bgtgt\b": "gtgt giá trị gia tăng",
+    r"\bvat\b": "vat giá trị gia tăng",
+    r"\bđkkd\b": "đkkd đăng ký kinh doanh",
+    r"\bdkth\b": "dkth điều kiện thực hiện",
+    r"\bqđ\b": "quyết định",
+    r"\bnđ\b": "nghị định",
+    r"\btt\b": "thông tư",
+    r"\bhđlđ\b": "hợp đồng lao động",
+    r"\bhdld\b": "hợp đồng lao động",
+    
+    # --- TỪ ĐIỂN ĐỒNG NGHĨA DÂN GIAN (Colloquial Synonyms) ---
+    r"\bxe máy\b": "xe máy xe mô tô xe gắn máy",
+    r"\bxe ôtô\b": "xe ôtô xe ô tô xe hơi",
+    r"\bô tô\b": "ô tô xe ô tô xe hơi",
+    r"\bsổ đỏ\b": "sổ đỏ giấy chứng nhận quyền sử dụng đất",
+    r"\bsổ hồng\b": "sổ hồng giấy chứng nhận quyền sở hữu nhà ở",
+    r"\bcmnd\b": "cmnd chứng minh nhân dân thẻ căn cước công dân",
+    r"\bcccd\b": "cccd thẻ căn cước công dân chứng minh nhân dân",
+    r"\bcăn cước\b": "căn cước thẻ căn cước công dân chứng minh nhân dân",
+    r"\bnghỉ đẻ\b": "nghỉ đẻ thai sản sinh con",
+    r"\bđuổi việc\b": "đuổi việc sa thải chấm dứt hợp đồng lao động",
+    r"\bđền bù\b": "đền bù bồi thường thiệt hại",
+    r"\bphạt nguội\b": "phạt nguội xử phạt vi phạm hành chính qua camera",
+    r"\bbằng lái xe\b": "bằng lái xe giấy phép lái xe",
+    r"\bgiấy phép lái xe\b": "giấy phép lái xe bằng lái xe",
+    r"\bly dị\b": "ly dị ly hôn",
+    r"\bcông an\b": "công an cảnh sát cơ quan điều tra",
+    r"\bđất đai\b": "đất đai quyền sử dụng đất",
+    r"\blàm luật\b": "làm luật hối lộ đưa hối lộ nhận hối lộ"
+}
+
+def expand_legal_query(query):
+    """
+    Tự động mở rộng câu hỏi pháp lý với các thuật ngữ viết tắt và đồng nghĩa
+    """
+    expanded = query.lower()
+    for pattern, replacement in LEGAL_ACRONYMS.items():
+        expanded = re.sub(pattern, replacement, expanded, flags=re.IGNORECASE)
+    return expanded
+
+def extract_law_numbers(text):
+    """
+    Trích xuất số hiệu văn bản pháp luật, ví dụ:
+    - 136/2020/nđ-cp
+    - 58/2016/tt-btc
+    - 45/2019/qh14
+    - 5868/qđ-byt
+    """
+    text = text.lower()
+    patterns = [
+        r'\b\d+/\d+/[a-zđ\-_]+',  # Ví dụ: 136/2020/nđ-cp, 58/2016/tt-btc
+        r'\b\d+/[a-zđ\-_]+'       # Ví dụ: 5868/qđ-byt
+    ]
+    matches = []
+    for p in patterns:
+        found = re.findall(p, text)
+        matches.extend(found)
+    return list(set(matches))
+
+def extract_article_number(text):
+    """
+    Trích xuất "Điều X" (Article X) từ câu hỏi.
+    Ví dụ: "Theo Điều 15..." -> "điều 15"
+    """
+    text = text.lower()
+    matches = re.findall(r'\bđiều\s+\d+\b', text)
+    return list(set(matches))
+
+from dense_retriever import DenseSearcher, FineTunedDenseSearcher, E5LargeSearcher, legal_chunk_document
+from sentence_transformers import CrossEncoder
+
+def get_best_chunk_bm25(query, text, max_chunk_chars=800):
+    """Tìm Chunk tốt nhất trong tài liệu chứa câu trả lời cho câu hỏi bằng BM25"""
+    chunks = legal_chunk_document(text, max_chunk_chars=max_chunk_chars, overlap=100, max_chunks=150)
+    if len(chunks) == 1:
+        return chunks[0]
+    
+    tokenized_chunks = [ch.lower().translate(str.maketrans('', '', string.punctuation)).split() for ch in chunks]
+    bm25 = BM25Okapi(tokenized_chunks)
+    
+    tokenized_query = query.lower().translate(str.maketrans('', '', string.punctuation)).split()
+    scores = bm25.get_scores(tokenized_query)
+    
+    best_idx = np.argmax(scores)
+    return chunks[best_idx]
+
+class CrossEncoderReranker:
+    def __init__(self, model_path="fine_tuned_vietnamese_cross_encoder", corpus=None):
+        import torch
+        self.corpus = corpus
+        # Tải Cross-Encoder đã train trên chính data luật của mình
+        print(f"🚀 KHỞi ĐỘNG CROSS-ENCODER RERANKER: '{model_path}'...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = CrossEncoder(model_path, device=device, model_kwargs={"torch_dtype": torch.float16 if device=="cuda" else torch.float32})
+        self.is_active = True
+
+    def rerank(self, query, top_docs):
+        if not self.is_active or not self.corpus:
+            return top_docs
+            
+        # Nối câu hỏi và đúng CÁI ĐIỀU LUẬT chứa câu trả lời
+        pairs = [[query, get_best_chunk_bm25(query, self.corpus[doc_id], max_chunk_chars=800)] for doc_id in top_docs]
+        
+        # Chấm điểm lại (batch_size nhỏ để không tràn VRAM 4GB)
+        scores = self.model.predict(pairs, batch_size=4)
+        
+        # Sắp xếp lại danh sách ứng viên dựa trên điểm Cross-Encoder
+        ranked_docs = [doc_id for _, doc_id in sorted(zip(scores, top_docs), key=lambda x: x[0], reverse=True)]
+        return ranked_docs
+
+class HybridSearcher:
+    def __init__(self, corpus):
+        print("🚀 Khởi tạo HỆ THỐNG HYBRID SOTA (BM25 + BGE-M3 Chunked + Fine-tuned Super)...")
+        self.corpus = corpus
+        self.doc_ids = list(corpus.keys())
+        
+        # Bản đồ số hiệu văn bản tra cứu O(1)
+        self.doc_law_numbers = {}
+        self.corpus_lower = {}
+        for doc_id in self.doc_ids:
+            self.corpus_lower[doc_id] = corpus[doc_id].lower()
+            title_line = corpus[doc_id].split("\n")[0]
+            laws = extract_law_numbers(title_line)
+            if laws:
+                self.doc_law_numbers[doc_id] = laws
+        
+        self.bm25_searcher = BM25Searcher(corpus, use_cache=True)
+        self.dense_searcher = DenseSearcher(corpus, use_cache=True)
+        self.finetuned_searcher = FineTunedDenseSearcher(corpus, use_cache=True)
+        self.e5_searcher = E5LargeSearcher(corpus, use_cache=True)
+        self.reranker = None
+
+    def search(self, query, top_k=5, candidate_k=150, rrf_k=10):
+        """
+        Bộ tham số Kỷ Lục Test (92.54%):
+        - rrf_k: 10
+        - candidate_k: 150
+        - w_bm25: 1.5
+        - w_bgem3: 0.5
+        - w_finetuned: 2.5
+        - w_e5: 1.0
+        """
+        query_laws = extract_law_numbers(query)
+        query_articles = extract_article_number(query)
+        
+        exact_matched_docs = set()
+        mega_boost_docs = set()
+        
+        for doc_id, doc_text_lower in self.corpus_lower.items():
+            has_law = False
+            has_article = False
+            
+            if query_laws and doc_id in self.doc_law_numbers:
+                for ql in query_laws:
+                    if any(ql in dl or dl in ql for dl in self.doc_law_numbers[doc_id]):
+                        has_law = True
+                        break
+            
+            if has_law and query_articles:
+                for qa in query_articles:
+                    if qa in doc_text_lower:
+                        has_article = True
+                        break
+                
+            if has_law and has_article:
+                mega_boost_docs.add(doc_id)
+            elif has_law:
+                exact_matched_docs.add(doc_id)
+
+        expanded_query = expand_legal_query(query)
+
+        bm25_top = self.bm25_searcher.search(expanded_query, top_k=candidate_k)
+        dense_top = self.dense_searcher.search(expanded_query, top_k=candidate_k)
+        finetuned_top = self.finetuned_searcher.search(expanded_query, top_k=candidate_k)
+        e5_top = self.e5_searcher.search(expanded_query, top_k=candidate_k)
+
+        scores = {}
+        for rank, doc_id in enumerate(bm25_top):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank + 1)) * 1.5
+
+        for rank, doc_id in enumerate(dense_top):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank + 1)) * 0.5
+
+        for rank, doc_id in enumerate(finetuned_top):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank + 1)) * 2.5
+
+        for rank, doc_id in enumerate(e5_top):
+            scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (rrf_k + rank + 1)) * 1.0
+
+        for doc_id in exact_matched_docs:
+            scores[doc_id] = scores.get(doc_id, 0.0) + 5.0
+            
+        for doc_id in mega_boost_docs:
+            scores[doc_id] = scores.get(doc_id, 0.0) + 7.0
+
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        top_k_candidates = [doc_id for doc_id, _ in sorted_docs[:candidate_k]]
+        
+        return top_k_candidates[:top_k]
+
+def create_submission(predictions, output_json="submission.json", output_zip="submission.zip"):
+    """
+    Tạo file submission.json và đóng gói thành submission.zip theo đúng chuẩn BTC
+    """
+    formatted_preds = {}
+    for qid, docs in predictions.items():
+        # Đảm bảo mỗi câu hỏi có tối đa 5 IDs
+        formatted_preds[str(qid)] = {
+            "answer": [str(d) for d in docs[:5]]
+        }
+
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(formatted_preds, f, ensure_ascii=False, indent=4)
+
+    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(output_json, arcname="submission.json")
+
+    print(f"\n🎉 Đã tạo thành công file nộp bài: '{output_zip}' (bên trong chứa '{output_json}')")
+
+if __name__ == "__main__":
+    # 1. Nạp dữ liệu
+    corpus = load_corpus()
+    train_data = load_train_data()
+    test_data = load_test_data()
+
+    # 2. Đánh giá thử trên 500 câu Validation để xem điểm Recall tăng lên bao nhiêu
+    val_items = list(train_data.items())[:500]
+    val_questions = {k: v["question"] for k, v in val_items}
+    val_truth = {k: v["answer"] for k, v in val_items}
+
+    hybrid = HybridSearcher(corpus)
+
+    print("\n🔍 Đang chạy tìm kiếm HYBRID trên 500 câu hỏi mẫu...")
+    val_preds = {}
+    for qid, question in tqdm(val_questions.items(), desc="Hybrid Validation"):
+        val_preds[qid] = hybrid.search(question, top_k=5)
+
+    results = compute_metrics(val_preds, val_truth, k=5)
+    print("\n" + "="*45)
+    print(f"📊 KẾT QUẢ HYBRID SEARCH (BM25 + DENSE):")
+    print(f"👉 Recall@5   : {results['Recall'] * 100:.2f}%")
+    print(f"👉 Precision@5: {results['Precision'] * 100:.2f}%")
+    print("="*45)
+
+    # 3. Chạy dự đoán trên toàn bộ 999 câu hỏi Public Test và tạo file nộp bài
+    print("\n📦 Đang sinh kết quả cho 999 câu hỏi Public Test...")
+    test_preds = {}
+    for qid, item in tqdm(test_data.items(), desc="Predicting Public Test"):
+        question = item["question"]
+        test_preds[qid] = hybrid.search(question, top_k=5)
+
+    create_submission(test_preds)
